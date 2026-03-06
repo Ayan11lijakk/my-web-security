@@ -1,3 +1,4 @@
+
 name: Build Chromium Windows EXE
 
 on:
@@ -14,46 +15,38 @@ jobs:
     timeout-minutes: 1440
 
     steps:
-      # ─────────────────────────────────────────
-      # 1. Checkout
-      # ─────────────────────────────────────────
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────
-      # 2. Setup Python
-      # ─────────────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ─────────────────────────────────────────
-      # 3. Install depot_tools
-      # ─────────────────────────────────────────
+      - name: Configure Git
+        shell: powershell
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.fscache true
+          git config --global core.preloadindex true
+          git config --global user.email "build@chromium.local"
+          git config --global user.name "Chromium Builder"
+          git config --global depot-tools.allowGlobalGitConfig true
+
       - name: Install depot_tools
         shell: powershell
         run: |
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
           echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $env:PATH = "C:\depot_tools;$env:PATH"
-          gclient --version
 
-      # ─────────────────────────────────────────
-      # 4. Cache Chromium Source
-      # ─────────────────────────────────────────
       - name: Cache Chromium Source
         id: cache_src
         uses: actions/cache@v4
         with:
           path: chromium_src
-          key: chromium-win-src-${{ env.CHROMIUM_VERSION }}-v2
-          restore-keys: |
-            chromium-win-src-${{ env.CHROMIUM_VERSION }}-
+          key: chromium-win-${{ env.CHROMIUM_VERSION }}-v5
 
-      # ─────────────────────────────────────────
-      # 5. Fetch Chromium Source
-      # ─────────────────────────────────────────
       - name: Fetch Chromium Source
         if: steps.cache_src.outputs.cache-hit != 'true'
         shell: powershell
@@ -65,22 +58,29 @@ jobs:
           New-Item -ItemType Directory -Force -Path chromium_src
           Set-Location chromium_src
 
-          # .gclient config
-          $gclient = @"
-          solutions = [
-            {
-              "name": "src",
-              "url": "https://chromium.googlesource.com/chromium/src.git",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {},
-            },
-          ]
-          target_os = ['win']
-          "@
-          $gclient | Out-File -FilePath .gclient -Encoding utf8
+          # .gclient — NO indentation, NO BOM
+          $gclientContent = "solutions = [`n" +
+            "  {`n" +
+            "    `"name`": `"src`",`n" +
+            "    `"url`": `"https://chromium.googlesource.com/chromium/src.git`",`n" +
+            "    `"managed`": False,`n" +
+            "    `"custom_deps`": {},`n" +
+            "    `"custom_vars`": {},`n" +
+            "  },`n" +
+            "]`n" +
+            "target_os = ['win']`n"
 
-          # Fetch source
+          [System.IO.File]::WriteAllText(
+            "$PWD\.gclient",
+            $gclientContent,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Verify
+          Write-Host "=== .gclient content ==="
+          Get-Content .gclient
+          Write-Host "========================"
+
           gclient sync `
             --no-history `
             --nohooks `
@@ -93,137 +93,134 @@ jobs:
             exit 1
           }
 
-      # ─────────────────────────────────────────
-      # 6. Setup Visual Studio & Windows SDK
-      # ─────────────────────────────────────────
-      - name: Setup Visual Studio Environment
+      - name: Setup VS Toolchain
         shell: powershell
         run: |
           $env:PATH = "C:\depot_tools;$env:PATH"
           $env:DEPOT_TOOLS_WIN_TOOLCHAIN = "1"
           $env:GYP_MSVS_VERSION = "2022"
-
           Set-Location chromium_src\src
-
-          # VS toolchain setup
           python build/vs_toolchain.py update --force
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "vs_toolchain.py failed, trying alternative..."
-            $env:DEPOT_TOOLS_WIN_TOOLCHAIN = "0"
-          }
-
       # ─────────────────────────────────────────
-      # 7. Apply Patches (Smart - Error Tolerant)
+      # FIXED Patch Apply — git apply ব্যবহার করে
       # ─────────────────────────────────────────
-      - name: Apply Anti-Detection Patches
+      - name: Apply Patches
         shell: bash
         run: |
           PATCHES_DIR="${{ github.workspace }}/patches"
-          CHROMIUM_SRC="${{ github.workspace }}/chromium_src/src"
-
-          cd "$CHROMIUM_SRC"
+          SRC="${{ github.workspace }}/chromium_src/src"
+          cd "$SRC"
 
           APPLIED=0
           FAILED=0
           SKIPPED=0
 
+          # সঠিক order — 000 MUST be first
           PATCH_ORDER=(
             "000-fingerprint-session-manager.patch"
             "001-remove-webdriver.patch"
             "002-remove-automation-flags.patch"
-            "020-canvas-noise.patch"
             "021-canvas-unified.patch"
             "022-navigator-unified.patch"
             "023-webgl-unified.patch"
             "024-audio-unified.patch"
             "025-screen-unified.patch"
-            "audio-fingerprint.patch"
             "automation-removal.patch"
-            "canvas-noise.patch"
             "cdp-removal.patch"
             "permissions-stealth.patch"
-            "webgl-fingerprint.patch"
           )
+
+          apply_single_patch() {
+            local pf="$1"
+            local name="$(basename $pf)"
+
+            # Clean: CRLF → LF, fake index lines remove
+            local CLEAN=$(mktemp /tmp/clean_XXXXXX.patch)
+            sed 's/\r//' "$pf" | \
+            sed '/^index [0-9a-f]\{7,40\}\.\.[0-9a-f]\{7,40\}/d' \
+            > "$CLEAN"
+
+            # Already applied check — skip করো
+            if git apply --check --reverse "$CLEAN" 2>/dev/null; then
+              echo "  ⚠ Already applied — skipping"
+              rm -f "$CLEAN"
+              return 2
+            fi
+
+            # Method 1: git apply (multi-file patch এর জন্য best)
+            if git apply --check "$CLEAN" 2>/dev/null; then
+              git apply "$CLEAN" 2>/dev/null && {
+                echo "  ✓ git apply"
+                rm -f "$CLEAN"
+                return 0
+              }
+            fi
+
+            # Method 2: whitespace fix
+            if git apply --whitespace=fix --check "$CLEAN" 2>/dev/null; then
+              git apply --whitespace=fix "$CLEAN" 2>/dev/null && {
+                echo "  ✓ whitespace fix"
+                rm -f "$CLEAN"
+                return 0
+              }
+            fi
+
+            # Method 3: 3-way merge
+            if git apply --3way "$CLEAN" 2>/dev/null; then
+              echo "  ✓ 3way merge"
+              rm -f "$CLEAN"
+              return 0
+            fi
+
+            # Method 4: patch fuzz (single-file patches এর জন্য)
+            if patch -p1 --fuzz=5 --ignore-whitespace \
+               --no-backup-if-mismatch --forward \
+               -i "$CLEAN" 2>/dev/null; then
+              echo "  ✓ patch fuzz=5"
+              rm -f "$CLEAN"
+              return 0
+            fi
+
+            rm -f "$CLEAN"
+            return 1
+          }
 
           for patch_name in "${PATCH_ORDER[@]}"; do
             patch_file="$PATCHES_DIR/$patch_name"
+            echo "──────────────────────────────"
+            echo "▶ $patch_name"
 
             if [ ! -f "$patch_file" ]; then
-              echo "⚠ SKIP (not found): $patch_name"
+              echo "  ⚠ File not found — skipping"
               ((SKIPPED++))
               continue
             fi
 
-            echo "──────────────────────────────────────"
-            echo "▶ Applying: $patch_name"
+            apply_single_patch "$patch_file"
+            rc=$?
 
-            # Method 1: git apply strict
-            if git apply --check "$patch_file" 2>/dev/null; then
-              git apply "$patch_file" && {
-                echo "✓ Applied (git apply): $patch_name"
-                ((APPLIED++))
-                continue
-              }
-            fi
-
-            # Method 2: git apply with whitespace fix
-            if git apply --whitespace=fix "$patch_file" 2>/dev/null; then
-              echo "✓ Applied (whitespace fix): $patch_name"
+            if [ $rc -eq 0 ]; then
               ((APPLIED++))
-              continue
+            elif [ $rc -eq 2 ]; then
+              ((SKIPPED++))
+            else
+              echo "  ✗ FAILED (build continues)"
+              find . -name "*.rej" -delete 2>/dev/null || true
+              ((FAILED++))
             fi
-
-            # Method 3: patch fuzz=3
-            if patch -p1 --fuzz=3 --ignore-whitespace \
-               --no-backup-if-mismatch -i "$patch_file" 2>/dev/null; then
-              echo "✓ Applied (fuzz=3): $patch_name"
-              ((APPLIED++))
-              continue
-            fi
-
-            # Method 4: patch fuzz=10
-            if patch -p1 --fuzz=10 --ignore-whitespace \
-               --no-backup-if-mismatch -i "$patch_file" 2>/dev/null; then
-              echo "✓ Applied (fuzz=10): $patch_name"
-              ((APPLIED++))
-              continue
-            fi
-
-            # Method 5: Strip index headers, try again
-            CLEAN=$(mktemp /tmp/patch_XXXXXX.patch)
-            grep -v '^index [0-9a-f]\{7\}\.\.' "$patch_file" > "$CLEAN" || true
-            if patch -p1 --fuzz=5 --ignore-whitespace \
-               --no-backup-if-mismatch -i "$CLEAN" 2>/dev/null; then
-              echo "✓ Applied (cleaned): $patch_name"
-              ((APPLIED++))
-              rm -f "$CLEAN"
-              continue
-            fi
-            rm -f "$CLEAN"
-
-            # All methods failed - WARNING only, don't stop build
-            echo "✗ FAILED (continuing anyway): $patch_name"
-            ((FAILED++))
           done
 
           echo ""
-          echo "════════════════════════════════════"
-          echo "Patch Summary:"
-          echo "  ✓ Applied : $APPLIED"
-          echo "  ✗ Failed  : $FAILED"
-          echo "  ⚠ Skipped : $SKIPPED"
-          echo "════════════════════════════════════"
+          echo "══════════════════════════════"
+          echo "✓ Applied : $APPLIED"
+          echo "✗ Failed  : $FAILED"
+          echo "⚠ Skipped : $SKIPPED"
+          echo "══════════════════════════════"
 
-          # Warning only - don't fail the build
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::warning::$FAILED patch(es) failed. Build continues..."
-          fi
+          find . -name "*.rej" -delete 2>/dev/null || true
 
-      # ─────────────────────────────────────────
-      # 8. Configure GN Build
-      # ─────────────────────────────────────────
-      - name: Configure GN Build
+      - name: Configure GN
         shell: powershell
         run: |
           $env:PATH = "C:\depot_tools;$env:PATH"
@@ -231,61 +228,37 @@ jobs:
           $env:GYP_MSVS_VERSION = "2022"
 
           Set-Location chromium_src\src
-
           New-Item -ItemType Directory -Force -Path out\Release
 
-          # args.gn write
-          $args_gn = @"
-          # Windows Anti-Detection Build
+          $argsContent = @'
           target_os = "win"
           target_cpu = "x64"
-
-          # Build Type
           is_debug = false
           is_official_build = true
           is_component_build = false
           is_clang = true
           use_lld = true
-
-          # Optimization
           symbol_level = 0
           blink_symbol_level = 0
           enable_nacl = false
-
-          # Codecs
           proprietary_codecs = true
           ffmpeg_branding = "Chrome"
-
-          # Anti-Detection
           enable_automation = false
-
-          # Disable unused features
           enable_pdf = false
           enable_print_preview = false
-          enable_nacl = false
-
-          # Warnings
           treat_warnings_as_errors = false
-          fatal_linker_warnings = false
-          "@
-          $args_gn | Out-File -FilePath out\Release\args.gn -Encoding utf8
+          fatal_linker_warnings = false'@
+       
+          [System.IO.File]::WriteAllText(
+            "$PWD\out\Release\args.gn",
+            $argsContent,
+            [System.Text.UTF8Encoding]::new($false)
+          )
 
-          # Run hooks
           gclient runhooks
-
-          # Generate build files
           gn gen out\Release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "GN gen failed!"
-            exit 1
-          }
-
-          Write-Host "GN configuration successful!"
-
-      # ─────────────────────────────────────────
-      # 9. Build Chromium
-      # ─────────────────────────────────────────
       - name: Build Chromium
         shell: powershell
         run: |
@@ -294,87 +267,35 @@ jobs:
 
           Set-Location chromium_src\src
 
-          $cores = (Get-WmiObject Win32_Processor).NumberOfLogicalProcessors
+          $cores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
           $jobs = [math]::Max(1, $cores - 2)
-
-          Write-Host "Building with $jobs parallel jobs..."
-          Write-Host "Build started: $(Get-Date)"
+          Write-Host "Building with $jobs jobs..."
 
           autoninja -j $jobs -C out\Release chrome chromedriver
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed!"
-            exit 1
-          }
-
-          Write-Host "Build completed: $(Get-Date)"
-
-      # ─────────────────────────────────────────
-      # 10. Package Output
-      # ─────────────────────────────────────────
-      - name: Package Build Output
+      - name: Package
         shell: powershell
         run: |
           Set-Location chromium_src\src\out\Release
+          New-Item -ItemType Directory -Force -Path pkg
 
-          New-Item -ItemType Directory -Force -Path antidetect-chromium-win
-
-          # Copy essential files
-          $files = @(
-            "chrome.exe",
-            "chromedriver.exe",
-            "chrome.dll",
-            "chrome_elf.dll",
-            "chrome_100_percent.pak",
-            "chrome_200_percent.pak",
-            "resources.pak",
-            "icudtl.dat",
-            "v8_context_snapshot.bin",
-            "snapshot_blob.bin"
-          )
-
-          foreach ($file in $files) {
-            if (Test-Path $file) {
-              Copy-Item $file antidetect-chromium-win\
-              Write-Host "Copied: $file"
-            }
+          @("chrome.exe","chromedriver.exe","chrome.dll",
+            "chrome_elf.dll","icudtl.dat","v8_context_snapshot.bin",
+            "snapshot_blob.bin") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ pkg\ }
           }
 
-          # Copy pak files
-          Get-ChildItem *.pak | Copy-Item -Destination antidetect-chromium-win\
-          Get-ChildItem *.bin | Copy-Item -Destination antidetect-chromium-win\
+          Get-ChildItem *.pak -EA 0 | Copy-Item -Dest pkg\
+          Get-ChildItem *.bin -EA 0 | Copy-Item -Dest pkg\
+          if (Test-Path locales) { Copy-Item -Recurse locales pkg\ }
 
-          # Copy locales
-          if (Test-Path locales) {
-            Copy-Item -Recurse locales antidetect-chromium-win\
-          }
+          Compress-Archive -Path pkg -DestinationPath antidetect-chromium-win-x64.zip -Force
+          $h = Get-FileHash antidetect-chromium-win-x64.zip -Algorithm SHA256
+          "$($h.Hash)  antidetect-chromium-win-x64.zip" |
+            Out-File antidetect-chromium-win-x64.zip.sha256
 
-          # Version info file
-          $version = @"
-          Chromium Anti-Detection Windows Build
-          Version: $env:CHROMIUM_VERSION
-          Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-          "@
-          $version | Out-File -FilePath antidetect-chromium-win\VERSION.txt
-
-          # Create zip
-          Compress-Archive `
-            -Path antidetect-chromium-win `
-            -DestinationPath antidetect-chromium-win-x64.zip `
-            -Force
-
-          # Checksum
-          $hash = Get-FileHash antidetect-chromium-win-x64.zip -Algorithm SHA256
-          "$($hash.Hash)  antidetect-chromium-win-x64.zip" | `
-            Out-File -FilePath antidetect-chromium-win-x64.zip.sha256
-
-          Write-Host ""
-          Write-Host "Build size: $([math]::Round((Get-Item antidetect-chromium-win-x64.zip).Length / 1MB, 2)) MB"
-
-      # ─────────────────────────────────────────
-      # 11. Upload Artifacts
-      # ─────────────────────────────────────────
-      - name: Upload Windows Build
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: antidetect-chromium-windows-x64
