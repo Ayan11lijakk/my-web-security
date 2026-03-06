@@ -123,7 +123,6 @@ jobs:
           FAILED=0
           SKIPPED=0
 
-          # সঠিক order — 000 MUST be first
           PATCH_ORDER=(
             "000-fingerprint-session-manager.patch"
             "001-remove-webdriver.patch"
@@ -142,49 +141,52 @@ jobs:
             local pf="$1"
             local name="$(basename $pf)"
 
-            # Clean: CRLF → LF, fake index lines remove
+            # Clean: CRLF→LF, fake index remove
             local CLEAN=$(mktemp /tmp/clean_XXXXXX.patch)
             sed 's/\r//' "$pf" | \
             sed '/^index [0-9a-f]\{7,40\}\.\.[0-9a-f]\{7,40\}/d' \
             > "$CLEAN"
 
-            # Already applied check — skip করো
+            # Already applied → skip
             if git apply --check --reverse "$CLEAN" 2>/dev/null; then
               echo "  ⚠ Already applied — skipping"
               rm -f "$CLEAN"
               return 2
             fi
 
-            # Method 1: git apply (multi-file patch এর জন্য best)
-            if git apply --check "$CLEAN" 2>/dev/null; then
-              git apply "$CLEAN" 2>/dev/null && {
-                echo "  ✓ git apply"
-                rm -f "$CLEAN"
-                return 0
-              }
-            fi
-
-            # Method 2: whitespace fix
-            if git apply --whitespace=fix --check "$CLEAN" 2>/dev/null; then
-              git apply --whitespace=fix "$CLEAN" 2>/dev/null && {
-                echo "  ✓ whitespace fix"
-                rm -f "$CLEAN"
-                return 0
-              }
-            fi
-
-            # Method 3: 3-way merge
-            if git apply --3way "$CLEAN" 2>/dev/null; then
-              echo "  ✓ 3way merge"
+            # ─────────────────────────────────────────
+            # Method 1: git apply
+            # নতুন directory+file তৈরি করতে পারে
+            # multi-file diff handle করে
+            # ─────────────────────────────────────────
+            if git apply \
+               --ignore-whitespace \
+               --whitespace=fix \
+               "$CLEAN" 2>/dev/null; then
+              echo "  ✓ git apply"
               rm -f "$CLEAN"
               return 0
             fi
 
-            # Method 4: patch fuzz (single-file patches এর জন্য)
-            if patch -p1 --fuzz=5 --ignore-whitespace \
-               --no-backup-if-mismatch --forward \
+            # Method 2: git apply 3way
+            if git apply \
+               --3way \
+               --ignore-whitespace \
+               --whitespace=fix \
+               "$CLEAN" 2>/dev/null; then
+              echo "  ✓ git apply 3way"
+              rm -f "$CLEAN"
+              return 0
+            fi
+
+            # Method 3: fuzz (single file patch এর জন্য)
+            if patch -p1 \
+               --fuzz=10 \
+               --ignore-whitespace \
+               --no-backup-if-mismatch \
+               --forward \
                -i "$CLEAN" 2>/dev/null; then
-              echo "  ✓ patch fuzz=5"
+              echo "  ✓ patch fuzz=10"
               rm -f "$CLEAN"
               return 0
             fi
@@ -199,7 +201,7 @@ jobs:
             echo "▶ $patch_name"
 
             if [ ! -f "$patch_file" ]; then
-              echo "  ⚠ File not found — skipping"
+              echo "  ⚠ Not found — skipping"
               ((SKIPPED++))
               continue
             fi
@@ -226,6 +228,7 @@ jobs:
           echo "══════════════════════════════"
 
           find . -name "*.rej" -delete 2>/dev/null || true
+                  
 
       - name: Configure GN
         shell: powershell
