@@ -154,11 +154,17 @@ jobs:
               return 2
             fi
 
-            # ─────────────────────────────────────────
-            # Method 1: git apply
-            # নতুন directory+file তৈরি করতে পারে
-            # multi-file diff handle করে
-            # ─────────────────────────────────────────
+            # ── Pre-create directories for new files in patch ──
+            grep '^+++ b/' "$CLEAN" | sed 's|^+++ b/||' | while read -r fpath; do
+              local dir
+              dir="$(dirname "$fpath")"
+              if [ ! -d "$dir" ]; then
+                echo "  📁 Creating directory: $dir"
+                mkdir -p "$dir"
+              fi
+            done
+
+            # Method 1: git apply (handles new files + multi-file diffs)
             if git apply \
                --ignore-whitespace \
                --whitespace=fix \
@@ -168,7 +174,21 @@ jobs:
               return 0
             fi
 
-            # Method 2: git apply 3way
+            # Method 2: git apply verbose (see actual error)
+            local ERRLOG
+            ERRLOG=$(mktemp /tmp/err_XXXXXX.log)
+            if git apply \
+               --ignore-whitespace \
+               --whitespace=fix \
+               "$CLEAN" 2>"$ERRLOG"; then
+              echo "  ✓ git apply (retry)"
+              rm -f "$CLEAN" "$ERRLOG"
+              return 0
+            fi
+            echo "  ⚠ git apply error: $(cat $ERRLOG)"
+            rm -f "$ERRLOG"
+
+            # Method 3: git apply 3way
             if git apply \
                --3way \
                --ignore-whitespace \
@@ -179,7 +199,7 @@ jobs:
               return 0
             fi
 
-            # Method 3: fuzz (single file patch এর জন্য)
+            # Method 4: patch with fuzz
             if patch -p1 \
                --fuzz=10 \
                --ignore-whitespace \
@@ -228,6 +248,7 @@ jobs:
           echo "══════════════════════════════"
 
           find . -name "*.rej" -delete 2>/dev/null || true
+                    
                   
 
       - name: Configure GN
